@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Hytale Server Updater v2.1.0-L (Linux)
 # DISCLAIMER: I ***Do Not*** use Linux regularly.
-#             This is just a direct port of the Powershell Logic.
+#             This is just a direct port of the Powershell Logic done with the help of Codex.
+#             It is as hardened as I could think to make it, but like I said, I'm not super familair with Linux scriping patterns.
 #             Please report any issues on GitHub.
 #             I will do my best to address them.
 # --------------------------------------------------
