@@ -1,7 +1,9 @@
-# Hytale Server Updater v2.0.0
+# Hytale Server Updater v2.1.0
 # --------------------------------------------------
 #                   CHANGE LOG
 # --------------------------------------------------
+# v2.1.0 - [Added]
+#          - Improved PowerShell UX: -WhatIf/-Verbose/-Confirm support and Write-Progress instead of stdout.
 # v2.0.0 - [Added]
 #          - Server-running check, staging & swap update, log file & summary,
 #            download retries with ZIP validation, and safer failure cleanup.
@@ -23,7 +25,7 @@
 #       This allows local scripts to run for your user account.
 # 5. The script will download and install the latest server files, reporting "Update Complete" when done.
 #
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
     [Parameter()]
     [string]$Destination,
@@ -31,12 +33,17 @@ param(
 )
 
 $scriptDir = $PSScriptRoot
-$logPath = Join-Path $scriptDir ("Update-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
 $script:ChangeSummary = [System.Collections.Generic.List[string]]::new()
+
+function Get-Dtg {
+    return (Get-Date).ToString("ddMMMyy-HHmm", [System.Globalization.CultureInfo]::InvariantCulture).ToUpperInvariant()
+}
+
+$logPath = Join-Path $scriptDir ("Update-" + (Get-Dtg) + ".log")
 
 function Write-Log {
     param([string]$Message)
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $timestamp = Get-Dtg
     $line = "[$timestamp] $Message"
     Write-Host $Message
     Add-Content -Path $logPath -Value $line
@@ -70,6 +77,7 @@ function Resolve-ServerRoot {
 }
 
 $serverRoot = Resolve-ServerRoot -BaseDir $scriptDir -ExplicitDestination $Destination
+Write-Verbose ("Server root: " + $serverRoot)
 $downloader = Join-Path $scriptDir "hytale-downloader-windows-amd64.exe"
 $downloaderTemp = $null
 
@@ -78,7 +86,7 @@ $zipPath = Join-Path $tempRoot "game.zip"
 $extractDir = Join-Path $tempRoot "game"
 $versionFile = Join-Path $serverRoot "last_version.txt"
 $stagingDir = Join-Path $serverRoot ".update_staging"
-$backupDir = Join-Path $serverRoot (".update_backup_" + (Get-Date -Format "yyyyMMdd-HHmmss"))
+$backupDir = Join-Path $serverRoot (".update_backup_" + (Get-Dtg))
 $success = $false
 
 function Test-ServerRunning {
@@ -100,12 +108,16 @@ New-Item -ItemType Directory -Path $tempRoot | Out-Null
 
 try {
     if (Test-ServerRunning -ServerDir $serverRoot) {
-        Write-Log "Server appears to be running. Stop the server before updating to avoid file locks or partial updates."
-        throw "Server running. Aborting update."
+        Write-Log "Hytale Server is currently running. Stop the server before updating."
+        throw "Server running. Exiting."
     }
 
     if (-not (Test-Path $downloader)) {
         Write-Log "Updater not found, fetching latest..."
+        if (-not $PSCmdlet.ShouldProcess($downloader, "Install/update downloader")) {
+            Write-Log "Download skipped by user."
+            return
+        }
         $downloaderTemp = Join-Path $env:TEMP ("hytale-downloader-" + [guid]::NewGuid().ToString("N"))
         New-Item -ItemType Directory -Path $downloaderTemp | Out-Null
         $downloaderZip = Join-Path $downloaderTemp "hytale-downloader.zip"
@@ -123,6 +135,11 @@ try {
     $newVersion = $null
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         Write-Log ("Downloading... (attempt $attempt of 3)")
+        if (-not $PSCmdlet.ShouldProcess($zipPath, "Download server package")) {
+            Write-Log "Download skipped by user."
+            return
+        }
+        Write-Progress -Id 1 -Activity "Downloading" -Status "Running downloader..." -PercentComplete 0
         $lastProgressLen = 0
         $newVersion = $null
         & $downloader -download-path $zipPath 2>&1 | ForEach-Object {
@@ -159,7 +176,7 @@ try {
         }
 
         if (-not (Test-Path $zipPath)) {
-            Write-Log "Download did not produce a ZIP. Retrying..."
+            Write-Log "Download did not produce an archive. Retrying..."
             Start-Sleep -Seconds 2
             continue
         }
@@ -169,7 +186,7 @@ try {
             $zip.Dispose()
         }
         catch {
-            Write-Log "Downloaded ZIP appears corrupt. Retrying..."
+            Write-Log "Downloaded archive is corrupt. Retrying..."
             Start-Sleep -Seconds 2
             continue
         }
@@ -179,8 +196,9 @@ try {
     }
 
     if (-not $downloaded) {
-        throw "Download failed after multiple attempts."
+        throw "Download failed."
     }
+    Write-Progress -Id 1 -Activity "Downloading" -Completed
 
     if ($newVersion) {
         $oldVersion = $null
@@ -194,12 +212,18 @@ try {
     }
 
     Write-Log "Extracting..."
+    if (-not $PSCmdlet.ShouldProcess($extractDir, "Extract server package")) {
+        Write-Log "Extraction skipped by user."
+        return
+    }
+    Write-Progress -Id 2 -Activity "Extracting" -Status "Expanding archive..." -PercentComplete 0
     New-Item -ItemType Directory -Path $extractDir | Out-Null
     Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+    Write-Progress -Id 2 -Activity "Extracting" -Completed
 
     $serverDir = Join-Path $extractDir "Server"
     if (-not (Test-Path $serverDir)) {
-        throw "Server folder not found: $serverDir"
+        throw "Server not found: $serverDir"
     }
 
     $preserve = @(
@@ -216,35 +240,68 @@ try {
 
     Write-Log "Updating..."
     if (Test-Path $stagingDir) {
-        Remove-Item -Path $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    New-Item -ItemType Directory -Path $stagingDir | Out-Null
-
-    Get-ChildItem -Path $serverDir -Force | ForEach-Object {
-        if ($preserve -contains $_.Name) { return }
-
-        $dest = Join-Path $stagingDir $_.Name
-        if ($_.PSIsContainer) {
-            Copy-Item -Path $_.FullName -Destination $dest -Recurse -Force
-        }
-        else {
-            Copy-Item -Path $_.FullName -Destination $dest -Force
+        if ($PSCmdlet.ShouldProcess($stagingDir, "Remove existing staging directory")) {
+            Remove-Item -Path $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    if (-not (Test-Path $stagingDir)) {
+        if (-not $PSCmdlet.ShouldProcess($stagingDir, "Create staging directory")) {
+            Write-Log "Staging directory creation skipped by user."
+            return
+        }
+        New-Item -ItemType Directory -Path $stagingDir | Out-Null
+    }
+
+    $updateItems = Get-ChildItem -Path $serverDir -Force | Where-Object { $preserve -notcontains $_.Name }
+    $totalStage = $updateItems.Count
+    $stageIndex = 0
+    foreach ($item in $updateItems) {
+        $stageIndex++
+        $percent = if ($totalStage -gt 0) { [int](($stageIndex / $totalStage) * 100) } else { 100 }
+        Write-Progress -Id 3 -Activity "Staging files" -Status "$stageIndex of $totalStage" -PercentComplete $percent
+        $dest = Join-Path $stagingDir $item.Name
+        Write-Verbose ("Staging: " + $item.FullName)
+        if ($PSCmdlet.ShouldProcess($dest, "Stage item")) {
+            if ($item.PSIsContainer) {
+                Copy-Item -Path $item.FullName -Destination $dest -Recurse -Force
+            }
+            else {
+                Copy-Item -Path $item.FullName -Destination $dest -Force
+            }
+        }
+    }
+    Write-Progress -Id 3 -Activity "Staging files" -Completed
 
     if (Test-Path $backupDir) {
-        Remove-Item -Path $backupDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    New-Item -ItemType Directory -Path $backupDir | Out-Null
-
-    Get-ChildItem -Path $stagingDir -Force | ForEach-Object {
-        $dest = Join-Path $serverRoot $_.Name
-        if (Test-Path $dest) {
-            Move-Item -Path $dest -Destination (Join-Path $backupDir $_.Name) -Force
+        if ($PSCmdlet.ShouldProcess($backupDir, "Remove existing backup directory")) {
+            Remove-Item -Path $backupDir -Recurse -Force -ErrorAction SilentlyContinue
         }
-        Move-Item -Path $_.FullName -Destination $dest -Force
-        $script:ChangeSummary.Add($_.Name) | Out-Null
     }
+    if (-not (Test-Path $backupDir)) {
+        if ($PSCmdlet.ShouldProcess($backupDir, "Create backup directory")) {
+            New-Item -ItemType Directory -Path $backupDir | Out-Null
+        }
+    }
+
+    $stagedItems = Get-ChildItem -Path $stagingDir -Force
+    $totalApply = $stagedItems.Count
+    $applyIndex = 0
+    foreach ($item in $stagedItems) {
+        $applyIndex++
+        $percent = if ($totalApply -gt 0) { [int](($applyIndex / $totalApply) * 100) } else { 100 }
+        Write-Progress -Id 4 -Activity "Applying update" -Status "$applyIndex of $totalApply" -PercentComplete $percent
+        $dest = Join-Path $serverRoot $item.Name
+        if (Test-Path $dest) {
+            if ((Test-Path $backupDir) -and $PSCmdlet.ShouldProcess($dest, "Backup existing file")) {
+                Move-Item -Path $dest -Destination (Join-Path $backupDir $item.Name) -Force
+            }
+        }
+        if ($PSCmdlet.ShouldProcess($dest, "Install updated file")) {
+            Move-Item -Path $item.FullName -Destination $dest -Force
+            $script:ChangeSummary.Add($item.Name) | Out-Null
+        }
+    }
+    Write-Progress -Id 4 -Activity "Applying update" -Completed
 
     $assetsZip = Join-Path $extractDir "Assets.zip"
     if (Test-Path $assetsZip) {
@@ -256,12 +313,18 @@ try {
         elseif ($serverParent -and (Test-Path (Join-Path $serverParent "Assets.zip"))) {
             $assetsDestDir = $serverParent
         }
-        Copy-Item -Path $assetsZip -Destination (Join-Path $assetsDestDir "Assets.zip") -Force
-        $script:ChangeSummary.Add("Assets.zip") | Out-Null
+        $assetsDest = Join-Path $assetsDestDir "Assets.zip"
+        Write-Verbose ("Assets.zip destination: " + $assetsDest)
+        if ($PSCmdlet.ShouldProcess($assetsDest, "Copy Assets.zip")) {
+            Copy-Item -Path $assetsZip -Destination $assetsDest -Force
+            $script:ChangeSummary.Add("Assets.zip") | Out-Null
+        }
     }
 
     if ($newVersion) {
-        Set-Content -Path $versionFile -Value $newVersion -NoNewline
+        if ($PSCmdlet.ShouldProcess($versionFile, "Write version file")) {
+            Set-Content -Path $versionFile -Value $newVersion -NoNewline
+        }
     }
 
     $success = $true
@@ -273,17 +336,23 @@ try {
 finally {
     if ($success -or $ForceCleanup) {
         if ($downloaderTemp -and (Test-Path $downloaderTemp)) {
-            Remove-Item -Path $downloaderTemp -Recurse -Force -ErrorAction SilentlyContinue
+            if ($PSCmdlet.ShouldProcess($downloaderTemp, "Remove downloader temp directory")) {
+                Remove-Item -Path $downloaderTemp -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
         if (Test-Path $tempRoot) {
-            Remove-Item -Path $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+            if ($PSCmdlet.ShouldProcess($tempRoot, "Remove update temp directory")) {
+                Remove-Item -Path $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
         if (Test-Path $stagingDir) {
-            Remove-Item -Path $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
+            if ($PSCmdlet.ShouldProcess($stagingDir, "Remove staging directory")) {
+                Remove-Item -Path $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     }
     else {
-        Write-Log "Update failed. Temp files kept for inspection:"
+        Write-Log "Update failed. Temp files preserved:"
         Write-Log "Temp: $tempRoot"
         Write-Log "Staging: $stagingDir"
     }
