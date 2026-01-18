@@ -76,7 +76,7 @@ function Resolve-ServerRoot {
         }
     }
 
-    throw "Unable to locate Hytale server. Pass -Destination to specify the server dir."
+    throw "Unable to locate Hytale server. Pass -Destination to specify the server directory."
 }
 
 $serverRoot = Resolve-ServerRoot -BaseDir $scriptDir -ExplicitDestination $Destination
