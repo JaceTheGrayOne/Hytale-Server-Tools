@@ -49,7 +49,12 @@ dry_run=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --destination|-d)
-      destination="${2:-}"
+      if [[ $# -lt 2 || "${2:0:1}" == "-" ]]; then
+        echo "Missing value for --destination" >&2
+        usage
+        exit 1
+      fi
+      destination="$2"
       shift 2
       ;;
     --force-cleanup)
@@ -75,6 +80,18 @@ done
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 log_enabled=1
 
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Missing required command: $cmd" >&2
+    exit 1
+  fi
+}
+
+for cmd in curl unzip tee pgrep find mktemp; do
+  require_cmd "$cmd"
+done
+
 dtg() {
   LC_ALL=C date +"%d%b%y-%H%M" | tr '[:lower:]' '[:upper:]'
 }
@@ -96,7 +113,11 @@ resolve_server_root() {
   local explicit_dest="$2"
 
   if [[ -n "$explicit_dest" ]]; then
-    realpath "$explicit_dest"
+    if [[ ! -d "$explicit_dest" ]]; then
+      echo "Destination does not exist or is not a directory: $explicit_dest" >&2
+      exit 1
+    fi
+    (cd "$explicit_dest" && pwd -P)
     return 0
   fi
 
@@ -128,14 +149,12 @@ staging_dir="${server_root}/.update_staging"
 backup_dir="${server_root}/.update_backup_$(dtg)"
 success=0
 
-if [[ $dry_run -eq 0 ]]; then
-  temp_root="$(mktemp -d /tmp/hytale-update-XXXXXX)"
-  zip_path="${temp_root}/game.zip"
-  extract_dir="${temp_root}/game"
-fi
+temp_root="$(mktemp -d /tmp/hytale-update-XXXXXX)"
+zip_path="${temp_root}/game.zip"
+extract_dir="${temp_root}/game"
 
 test_server_running() {
-  if pgrep -f 'HytaleServer\.jar|HytaleServer\.aot' >/dev/null 2>&1; then
+  if pgrep -f -- 'java .*HytaleServer\.jar|HytaleServer\.aot' >/dev/null 2>&1; then
     return 0
   fi
   return 1
@@ -251,9 +270,12 @@ else
 fi
 
 server_dir="${extract_dir}/Server"
-if [[ $dry_run -eq 0 && ! -d "$server_dir" ]]; then
-  echo "Server not found: $server_dir" >&2
-  exit 1
+if [[ $dry_run -eq 0 ]]; then
+  server_dir="$(find "$extract_dir" -maxdepth 3 -type d -name 'Server' -print -quit 2>/dev/null || true)"
+  if [[ -z "$server_dir" ]]; then
+    echo "Server directory not found under: $extract_dir" >&2
+    exit 1
+  fi
 fi
 
 preserve_items=(
@@ -287,27 +309,23 @@ else
   fi
   mkdir -p "$staging_dir"
 
-  shopt -s dotglob
+  shopt -s dotglob nullglob
   for item in "$server_dir"/*; do
     name="$(basename "$item")"
     if should_preserve "$name"; then
       continue
     fi
     dest="${staging_dir}/${name}"
-    if [[ -d "$item" ]]; then
-      cp -a "$item" "$dest"
-    else
-      cp -a "$item" "$dest"
-    fi
+    cp -a "$item" "$dest"
   done
-  shopt -u dotglob
+  shopt -u nullglob dotglob
 
   if [[ -d "$backup_dir" ]]; then
     rm -rf "$backup_dir"
   fi
   mkdir -p "$backup_dir"
 
-  shopt -s dotglob
+  shopt -s dotglob nullglob
   for item in "$staging_dir"/*; do
     name="$(basename "$item")"
     dest="${server_root}/${name}"
@@ -316,10 +334,13 @@ else
     fi
     mv "$item" "$dest"
   done
-  shopt -u dotglob
+  shopt -u nullglob dotglob
 fi
 
 assets_zip="${extract_dir}/Assets.zip"
+if [[ $dry_run -eq 0 ]]; then
+  assets_zip="$(find "$extract_dir" -maxdepth 3 -type f -name 'Assets.zip' -print -quit 2>/dev/null || true)"
+fi
 if [[ $dry_run -eq 1 || -f "$assets_zip" ]]; then
   assets_dest_dir="$server_root"
   server_parent="$(dirname "$server_root")"
