@@ -1,0 +1,21 @@
+name: Release Scripts
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare assets
+        run: |
+          mkdir -p dist
+          cp Update/Windows/HytaleServerUpdater.ps1 dist/HytaleServerUpdater-windows.ps1
+          cp Update/Linux/HytaleServerUpdater.sh dist/HytaleServerUpdater-linux.sh
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

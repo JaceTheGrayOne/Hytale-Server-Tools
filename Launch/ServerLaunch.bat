@@ -1,0 +1,1 @@
+java -XX:AOTCache=HytaleServer.aot -Xms4G -Xmx12G -jar HytaleServer.jar --assets Assets.zip --backup --backup-dir backup --backup-frequency 30

@@ -40,8 +40,6 @@ function Get-Dtg {
     return (Get-Date).ToString("ddMMMyy-HHmmss", [System.Globalization.CultureInfo]::InvariantCulture).ToUpperInvariant()
 }
 
-$logPath = Join-Path $scriptDir ("Update-" + (Get-Dtg) + ".log")
-
 function Write-Log {
     param([string]$Message)
     $timestamp = Get-Dtg
@@ -86,17 +84,59 @@ function Resolve-ServerRoot {
     throw "Unable to locate Hytale server. Pass -Destination to specify the server directory."
 }
 
+function Clear-UpdateHistory {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [string]$Root,
+        [int]$Keep = 3
+    )
+
+    if (-not (Test-Path $Root)) {
+        return
+    }
+
+    $logs = Get-ChildItem -Path $Root -Filter "Update-*.log" -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending
+    $backups = Get-ChildItem -Path $Root -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "backup_*" } |
+        Sort-Object LastWriteTime -Descending
+
+    foreach ($item in ($logs | Select-Object -Skip $Keep)) {
+        if ($PSCmdlet.ShouldProcess($item.FullName, "Remove old update log")) {
+            Remove-Item -Path $item.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    foreach ($item in ($backups | Select-Object -Skip $Keep)) {
+        if ($PSCmdlet.ShouldProcess($item.FullName, "Remove old update backup")) {
+            Remove-Item -Path $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 $serverRoot = Resolve-ServerRoot -BaseDir $scriptDir -ExplicitDestination $Destination
 Write-Verbose ("Server root: " + $serverRoot)
+$updateRoot = Join-Path $serverRoot ".update"
+$legacyVersionFile = Join-Path $serverRoot "last_version.txt"
+$versionFile = Join-Path $updateRoot "last_version.txt"
+if (-not $WhatIfPreference) {
+    if (-not (Test-Path $updateRoot)) {
+        New-Item -ItemType Directory -Path $updateRoot | Out-Null
+    }
+    if ((Test-Path $legacyVersionFile) -and -not (Test-Path $versionFile)) {
+        Move-Item -Path $legacyVersionFile -Destination $versionFile -Force
+    }
+}
+
+$logPath = Join-Path $updateRoot ("Update-" + (Get-Dtg) + ".log")
 $downloader = Join-Path $scriptDir "hytale-downloader-windows-amd64.exe"
 $downloaderTemp = $null
 
 $tempRoot = Join-Path $env:TEMP ("hytale-update-" + [guid]::NewGuid().ToString("N"))
 $zipPath = Join-Path $tempRoot "game.zip"
 $extractDir = Join-Path $tempRoot "game"
-$versionFile = Join-Path $serverRoot "last_version.txt"
-$stagingDir = Join-Path $serverRoot ".update_staging"
-$backupDir = Join-Path $serverRoot (".update_backup_" + (Get-Dtg))
+$stagingDir = Join-Path $updateRoot "staging"
+$backupDir = Join-Path $updateRoot ("backup_" + (Get-Dtg))
 $success = $false
 
 function Test-ServerRunning {
@@ -167,11 +207,16 @@ try {
             if (-not $newVersion -and $line -match 'version\s+([^)]+)\)') {
                 $newVersion = $Matches[1].Trim()
             }
-            if ($line -match '^\[' -and $line -match '%') {
-                if ($line -match '(\d+)%') {
-                    $percent = [int]$Matches[1]
-                    Write-Progress -Id 1 -Activity "Downloading" -Status $line -PercentComplete $percent
+            if ($line -match '^\[[^\]]*\]$' -and -not ($line -match '%')) {
+                return
+            }
+            if ($line -match '(\d+(?:\.\d+)?)%') {
+                $percent = [int][Math]::Round([double]$Matches[1], 0)
+                $status = ($line -replace '^\[[^\]]*\]\s*', '')
+                if ([string]::IsNullOrWhiteSpace($status)) {
+                    $status = "Downloading..."
                 }
+                Write-Progress -Id 1 -Activity "Downloading" -Status $status -PercentComplete $percent
                 return
             }
             Write-Information $line -InformationAction Continue
@@ -193,16 +238,6 @@ try {
             continue
         }
 
-        try {
-            $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
-            $zip.Dispose()
-        }
-        catch {
-            Write-Log "Downloaded archive is corrupt. Retrying..."
-            Start-Sleep -Seconds 2
-            continue
-        }
-
         $downloaded = $true
         break
     }
@@ -216,6 +251,9 @@ try {
         $oldVersion = $null
         if (Test-Path $versionFile) {
             $oldVersion = Get-Content $versionFile -Raw
+        }
+        elseif (Test-Path $legacyVersionFile) {
+            $oldVersion = Get-Content $legacyVersionFile -Raw
         }
         if ($newVersion -eq $oldVersion) {
             Write-Log "Up to date: ($newVersion). Exiting."
@@ -236,10 +274,8 @@ try {
         }
     }
     else {
-        Write-Progress -Id 2 -Activity "Extracting" -Status "Expanding archive..." -PercentComplete 0
         New-Item -ItemType Directory -Path $extractDir | Out-Null
         Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
-        Write-Progress -Id 2 -Activity "Extracting" -Completed
     }
 
     $serverDir = Join-Path $extractDir "Server"
@@ -364,6 +400,9 @@ try {
 }
 finally {
     if ((-not $WhatIfPreference) -and ($success -or $ForceCleanup)) {
+        if ($success) {
+            Clear-UpdateHistory -Root $updateRoot -Keep 3
+        }
         if ($downloaderTemp -and (Test-Path $downloaderTemp)) {
             if ($PSCmdlet.ShouldProcess($downloaderTemp, "Remove downloader temp directory")) {
                 Remove-Item -Path $downloaderTemp -Recurse -Force -ErrorAction SilentlyContinue
