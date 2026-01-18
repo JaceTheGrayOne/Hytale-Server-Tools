@@ -37,7 +37,7 @@ $script:ChangeSummary = [System.Collections.Generic.List[string]]::new()
 $script:LogEnabled = -not $WhatIfPreference
 
 function Get-Dtg {
-    return (Get-Date).ToString("ddMMMyy-HHmm", [System.Globalization.CultureInfo]::InvariantCulture).ToUpperInvariant()
+    return (Get-Date).ToString("ddMMMyy-HHmmss", [System.Globalization.CultureInfo]::InvariantCulture).ToUpperInvariant()
 }
 
 $logPath = Join-Path $scriptDir ("Update-" + (Get-Dtg) + ".log")
@@ -46,7 +46,7 @@ function Write-Log {
     param([string]$Message)
     $timestamp = Get-Dtg
     $line = "[$timestamp] $Message"
-    Write-Host $Message
+    Write-Information $Message -InformationAction Continue
     if ($script:LogEnabled) {
         Add-Content -Path $logPath -Value $line
     }
@@ -59,7 +59,14 @@ function Resolve-ServerRoot {
     )
 
     if ($ExplicitDestination) {
-        return (Resolve-Path -Path $ExplicitDestination).Path
+        $fullPath = [IO.Path]::GetFullPath($ExplicitDestination)
+        if (-not (Test-Path $fullPath)) {
+            throw "Destination does not exist: $fullPath"
+        }
+        if (-not (Test-Path (Join-Path $fullPath "HytaleServer.jar")) -and -not (Test-Path (Join-Path $fullPath "HytaleServer.aot"))) {
+            throw "Destination does not appear to be a Hytale server directory: $fullPath"
+        }
+        return $fullPath
     }
 
     $markers = @("HytaleServer.jar", "HytaleServer.aot")
@@ -122,6 +129,7 @@ try {
         if (-not $PSCmdlet.ShouldProcess($downloader, "Install/update downloader")) {
             Write-Log "Downloader install skipped by user."
             if (-not $WhatIfPreference) {
+                $success = $true
                 return
             }
         }
@@ -142,13 +150,17 @@ try {
     $newVersion = $null
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         if (-not $PSCmdlet.ShouldProcess($zipPath, "Download server package")) {
-            Write-Log "Download skipped by user (dry run)."
-            $downloaded = $true
-            break
+            if ($WhatIfPreference) {
+                Write-Log "Download skipped by user (dry run)."
+                $downloaded = $true
+                break
+            }
+            Write-Log "Download canceled by user."
+            $success = $true
+            return
         }
         Write-Log ("Downloading... (attempt $attempt of 3)")
         Write-Progress -Id 1 -Activity "Downloading" -Status "Running downloader..." -PercentComplete 0
-        $lastProgressLen = 0
         $newVersion = $null
         & $downloader -download-path $zipPath 2>&1 | ForEach-Object {
             $line = $_.ToString()
@@ -156,26 +168,16 @@ try {
                 $newVersion = $Matches[1].Trim()
             }
             if ($line -match '^\[' -and $line -match '%') {
-                $pad = ""
-                if ($lastProgressLen -gt $line.Length) {
-                    $pad = " " * ($lastProgressLen - $line.Length)
+                if ($line -match '(\d+)%') {
+                    $percent = [int]$Matches[1]
+                    Write-Progress -Id 1 -Activity "Downloading" -Status $line -PercentComplete $percent
                 }
-                Write-Host -NoNewline ("`r" + $line + $pad)
-                $lastProgressLen = $line.Length
                 return
             }
-
-            if ($lastProgressLen -gt 0) {
-                Write-Host ""
-                $lastProgressLen = 0
-            }
-            Write-Host $line
+            Write-Information $line -InformationAction Continue
             if ($script:LogEnabled) {
                 Add-Content -Path $logPath -Value $line
             }
-        }
-        if ($lastProgressLen -gt 0) {
-            Write-Host ""
         }
 
         $exitCode = $LASTEXITCODE
@@ -217,13 +219,21 @@ try {
         }
         if ($newVersion -eq $oldVersion) {
             Write-Log "Up to date: ($newVersion). Exiting."
+            $success = $true
             return
         }
     }
 
     Write-Log "Extracting..."
     if (-not $PSCmdlet.ShouldProcess($extractDir, "Extract server package")) {
-        Write-Log "Extraction skipped by user (dry run)."
+        if ($WhatIfPreference) {
+            Write-Log "Extraction skipped by user (dry run)."
+        }
+        else {
+            Write-Log "Extraction canceled by user."
+            $success = $true
+            return
+        }
     }
     else {
         Write-Progress -Id 2 -Activity "Extracting" -Status "Expanding archive..." -PercentComplete 0
@@ -264,6 +274,7 @@ try {
         if (-not (Test-Path $stagingDir)) {
             if (-not $PSCmdlet.ShouldProcess($stagingDir, "Create staging directory")) {
                 Write-Log "Staging directory creation skipped by user."
+                $success = $true
                 return
             }
             New-Item -ItemType Directory -Path $stagingDir | Out-Null
